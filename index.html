@@ -1,0 +1,314 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>WeAreUMAS</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="icon" type="image/svg+xml" href="assets/bg.svg">
+  <style>
+    :root {
+      --uma-theme-color: #d6effb;
+      --bg-dark: #000000;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      background: var(--bg-dark);
+      min-height: 100vh;
+      min-height: 100dvh;
+      touch-action: manipulation;
+      overscroll-behavior: none;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Square game field */
+    .board-frame {
+      position: relative;
+      width: min(100vw, 100vh);
+      height: min(100vw, 100vh);
+      width: min(100vw, 100dvh);
+      height: min(100vw, 100dvh);
+      aspect-ratio: 1 / 1;
+      overflow: hidden;
+    }
+
+    /* Background layer tinted with Uma color */
+    .board-bg {
+      position: absolute;
+      inset: 0;
+      background-image: url('assets/bg.svg');
+      background-size: cover;
+      background-position: center;
+      background-color: var(--uma-theme-color);
+      background-blend-mode: multiply;
+      transition: background-color 0.4s ease;
+      pointer-events: none;
+    }
+
+    #gameCanvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+
+    /* Click ripple */
+    .click-ripple {
+      position: fixed;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.6);
+      pointer-events: none;
+      width: 40px;
+      height: 40px;
+      transform: translate(-50%, -50%) scale(0);
+      animation: ripple-anim 0.4s ease-out forwards;
+      z-index: 9999;
+    }
+
+    @keyframes ripple-anim {
+      0% { transform: translate(-50%, -50%) scale(0); opacity: 1; border-width: 4px; }
+      100% { transform: translate(-50%, -50%) scale(2); opacity: 0; border-width: 1px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="board-frame" id="boardFrame">
+    <div class="board-bg"></div>
+    <canvas id="gameCanvas" width="800" height="800"></canvas>
+  </div>
+
+  <script>
+    // ================= CONFIG =================
+    const CONFIG = {
+      virtualSize: 800,        // virtual field size
+      targetScore: 1000,       // reaching it restarts the game
+      maxObjects: 50,          // reaching it restarts the game
+      baseSpawnInterval: 2.0,
+      minSpawnInterval: 0.2,
+      scoreFactor: 50,
+      volume: 0.5
+    };
+
+    const UMA = {
+      spriteSheet: 'assets/uma_01.png',
+      themeColor: '#d6effb',
+      displayHeight: 180,      // Uma height on the 800x800 field (change model size here)
+      frameWidth: 188,
+      frameHeight: 298,
+      cols: 12,
+      frameCount: 84,
+      fps: 60
+    };
+
+    const spawnInterval = (score) =>
+      Math.max(CONFIG.minSpawnInterval, CONFIG.baseSpawnInterval / (1 + score / CONFIG.scoreFactor));
+
+    // ================= AUDIO =================
+    const sounds = {
+      pop: new Audio('assets/pop.mp3'),
+      click: new Audio('assets/click.mp3')
+    };
+    Object.values(sounds).forEach(a => { a.preload = 'auto'; });
+
+    function playSound(name) {
+      const clone = sounds[name].cloneNode();
+      clone.volume = CONFIG.volume;
+      clone.play().catch(() => {});
+    }
+
+    // ================= CANVAS =================
+    const boardFrame = document.getElementById('boardFrame');
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    let scale = 1;
+
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      scale = (rect.width / CONFIG.virtualSize) * dpr;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function clientToVirtual(cx, cy) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (cx - rect.left) * (CONFIG.virtualSize / rect.width),
+        y: (cy - rect.top) * (CONFIG.virtualSize / rect.height)
+      };
+    }
+
+    boardFrame.style.setProperty('--uma-theme-color', UMA.themeColor);
+
+    // ================= GAME STATE =================
+    const umaWidth = Math.round(UMA.displayHeight * UMA.frameWidth / UMA.frameHeight);
+    const umaHeight = UMA.displayHeight;
+    const DESTROY_DURATION = 0.15;
+
+    let spriteImage = null;
+    let objects = [];
+    let score = 0;
+    let spawnTimer = 0;
+    let lastTime = 0;
+
+    function startGame() {
+      score = 0;
+      objects = [];
+      spawnTimer = 0;
+      spawnUma();
+    }
+
+    function spawnUma() {
+      if (objects.length >= CONFIG.maxObjects) {
+        startGame();
+        return;
+      }
+
+      objects.push({
+        x: Math.random() * Math.max(0, CONFIG.virtualSize - umaWidth),
+        y: Math.random() * Math.max(0, CONFIG.virtualSize - umaHeight),
+        frame: 0,
+        finished: false,
+        destroyed: false,
+        destroyProgress: 0
+      });
+      playSound('pop');
+
+      if (objects.length >= CONFIG.maxObjects) startGame();
+    }
+
+    function handleHit(clientX, clientY) {
+      const { x, y } = clientToVirtual(clientX, clientY);
+
+      // Topmost (latest spawned) first
+      for (let i = objects.length - 1; i >= 0; i--) {
+        const o = objects[i];
+        if (o.destroyed) continue;
+        if (x >= o.x && x <= o.x + umaWidth && y >= o.y && y <= o.y + umaHeight) {
+          o.destroyed = true;
+          o.destroyProgress = 0;
+          score += 1;
+          if (score >= CONFIG.targetScore) startGame();
+          else spawnUma(); // new Uma right after the pop
+          return; // one Uma per click
+        }
+      }
+    }
+
+    // ================= UPDATE / RENDER =================
+    function update(dt) {
+      spawnTimer += dt;
+      const interval = spawnInterval(score);
+      if (spawnTimer >= interval) {
+        spawnTimer -= interval;
+        spawnUma();
+      }
+
+      for (let i = objects.length - 1; i >= 0; i--) {
+        const o = objects[i];
+        if (o.destroyed) {
+          o.destroyProgress += dt / DESTROY_DURATION;
+          if (o.destroyProgress >= 1) objects.splice(i, 1);
+        } else if (!o.finished) {
+          o.frame += dt * UMA.fps;
+          if (o.frame >= UMA.frameCount - 1) {
+            o.frame = UMA.frameCount - 1;
+            o.finished = true; // hold on last frame
+          }
+        }
+      }
+
+    }
+
+    function render() {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.scale(scale, scale);
+
+      for (const o of objects) {
+        const idx = Math.min(Math.floor(o.frame), UMA.frameCount - 1);
+        const sx = (idx % UMA.cols) * UMA.frameWidth;
+        const sy = Math.floor(idx / UMA.cols) * UMA.frameHeight;
+
+        ctx.save();
+        if (o.destroyed) {
+          const s = 1 + o.destroyProgress * 0.3;
+          ctx.globalAlpha = Math.max(0, 1 - o.destroyProgress);
+          const cx = o.x + umaWidth / 2;
+          const cy = o.y + umaHeight / 2;
+          ctx.translate(cx, cy);
+          ctx.scale(s, s);
+          ctx.translate(-cx, -cy);
+        }
+        ctx.drawImage(spriteImage, sx, sy, UMA.frameWidth, UMA.frameHeight, o.x, o.y, umaWidth, umaHeight);
+        ctx.restore();
+      }
+    }
+
+    function loop(timestamp) {
+      const dt = Math.min(0.1, (timestamp - lastTime) / 1000);
+      lastTime = timestamp;
+      update(dt);
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    // ================= INPUT =================
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      handleHit(e.clientX, e.clientY);
+    });
+
+    // Global click sound and ripple
+    window.addEventListener('pointerdown', (e) => {
+      playSound('click');
+
+      const ripple = document.createElement('div');
+      ripple.className = 'click-ripple';
+      ripple.style.left = e.clientX + 'px';
+      ripple.style.top = e.clientY + 'px';
+      document.body.appendChild(ripple);
+      ripple.addEventListener('animationend', () => ripple.remove());
+    });
+
+    // ================= TELEGRAM MINI APP =================
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+      if (tg.setHeaderColor) tg.setHeaderColor('#000000');
+      if (tg.setBackgroundColor) tg.setBackgroundColor('#000000');
+    }
+
+    // ================= INIT =================
+    const img = new Image();
+    img.onload = () => {
+      spriteImage = img;
+      startGame();
+      lastTime = performance.now();
+      requestAnimationFrame(loop);
+    };
+    img.src = UMA.spriteSheet;
+  </script>
+</body>
+</html>
+
+
+
+
